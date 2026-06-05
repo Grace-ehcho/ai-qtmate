@@ -4,6 +4,7 @@ import time
 import traceback
 from datetime import datetime
 
+import requests
 import streamlit as st
 from google import genai
 from google.genai import types, errors as genai_errors
@@ -14,6 +15,24 @@ FLASH_MODEL     = "gemini-2.5-flash-lite"
 PRO_MODEL       = "gemini-2.5-flash"
 MAX_HISTORY     = 10
 EXTRACT_TIMEOUT = 15  # seconds
+
+BIBLE_BOOKS = {
+    "창세기": 1, "출애굽기": 2, "레위기": 3, "민수기": 4, "신명기": 5,
+    "여호수아": 6, "사사기": 7, "룻기": 8, "사무엘상": 9, "사무엘하": 10,
+    "열왕기상": 11, "열왕기하": 12, "역대상": 13, "역대하": 14, "에스라": 15,
+    "느헤미야": 16, "에스더": 17, "욥기": 18, "시편": 19, "잠언": 20,
+    "전도서": 21, "아가": 22, "이사야": 23, "예레미야": 24, "예레미야애가": 25,
+    "에스겔": 26, "다니엘": 27, "호세아": 28, "요엘": 29, "아모스": 30,
+    "오바댜": 31, "요나": 32, "미가": 33, "나훔": 34, "하박국": 35,
+    "스바냐": 36, "학개": 37, "스가랴": 38, "말라기": 39,
+    "마태복음": 40, "마가복음": 41, "누가복음": 42, "요한복음": 43,
+    "사도행전": 44, "로마서": 45, "고린도전서": 46, "고린도후서": 47,
+    "갈라디아서": 48, "에베소서": 49, "빌립보서": 50, "골로새서": 51,
+    "데살로니가전서": 52, "데살로니가후서": 53, "디모데전서": 54, "디모데후서": 55,
+    "디도서": 56, "빌레몬서": 57, "히브리서": 58, "야고보서": 59,
+    "베드로전서": 60, "베드로후서": 61, "요한일서": 62, "요한이서": 63,
+    "요한삼서": 64, "유다서": 65, "요한계시록": 66,
+}
 
 DEFAULT_CHARACTER = {
     "name": "지혜로운 조언자",
@@ -88,6 +107,24 @@ def server_key_set() -> bool:
 
 def make_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
+
+
+# ── 성경 불러오기 ─────────────────────────────────────────
+def fetch_bible_text(book_id: int, chapter: int, start_verse: int, end_verse: int) -> str:
+    url = f"https://bolls.life/get-text/KRV/{book_id}/{chapter}/"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        verses = resp.json()
+        lines = [
+            f"{v['verse']}절 {v['text'].strip()}"
+            for v in verses
+            if start_verse <= v["verse"] <= end_verse
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        _log(f"[성경불러오기] 오류: {e}")
+        return ""
 
 
 # ── 인물 추출 (Flash) ──────────────────────────────────────
@@ -332,6 +369,33 @@ def main() -> None:
 
     # ── Step 1: 성경 본문 입력 ────────────────────────────
     st.header("📖 오늘의 말씀")
+
+    fetch_mode = st.toggle("📥 성경 구절 불러오기", value=False)
+
+    if fetch_mode:
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        with c1:
+            book_name = st.selectbox("성경책", list(BIBLE_BOOKS.keys()), label_visibility="collapsed")
+        with c2:
+            chapter_num = st.number_input("장", min_value=1, max_value=150, value=1, step=1)
+        with c3:
+            sv = st.number_input("시작 절", min_value=1, value=1, step=1)
+        with c4:
+            ev = st.number_input("끝 절", min_value=1, value=1, step=1)
+
+        if st.button("📥 말씀 불러오기", type="secondary"):
+            with st.spinner("말씀을 불러오는 중..."):
+                fetched = fetch_bible_text(BIBLE_BOOKS[book_name], chapter_num, sv, ev)
+            if fetched:
+                header = f"{book_name} {chapter_num}:{sv}" + (f"~{ev}" if ev > sv else "")
+                st.session_state.bible_text = f"[{header}]\n{fetched}"
+                st.session_state.extraction_done = False
+                st.session_state.selected_character = None
+                st.session_state.messages = []
+                st.rerun()
+            else:
+                st.error("말씀을 불러오지 못했습니다. 장/절 번호를 확인해주세요.")
+
     bible_text = st.text_area(
         "성경 본문",
         value=st.session_state.bible_text,
