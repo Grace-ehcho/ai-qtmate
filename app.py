@@ -11,10 +11,11 @@ from google.genai import types, errors as genai_errors
 from google.api_core import exceptions as google_exceptions
 
 # ── 상수 ──────────────────────────────────────────────────
-FLASH_MODEL     = "gemini-2.5-flash-lite"
-PRO_MODEL       = "gemini-2.5-flash"
-MAX_HISTORY     = 10
-EXTRACT_TIMEOUT = 15  # seconds
+FLASH_MODEL        = "gemini-2.5-flash"
+PRO_MODEL          = "gemini-2.5-flash"
+MAX_HISTORY        = 10
+EXTRACT_TIMEOUT    = 20  # seconds
+QUOTA_RETRY_WAITS  = [15, 30]  # 429 재시도 대기(초): 1차 15s, 2차 30s
 
 BIBLE_BOOKS = {
     "창세기": 1, "출애굽기": 2, "레위기": 3, "민수기": 4, "신명기": 5,
@@ -32,6 +33,24 @@ BIBLE_BOOKS = {
     "디도서": 56, "빌레몬서": 57, "히브리서": 58, "야고보서": 59,
     "베드로전서": 60, "베드로후서": 61, "요한일서": 62, "요한이서": 63,
     "요한삼서": 64, "유다서": 65, "요한계시록": 66,
+}
+
+BIBLE_CHAPTERS = {
+    "창세기": 50, "출애굽기": 40, "레위기": 27, "민수기": 36, "신명기": 34,
+    "여호수아": 24, "사사기": 21, "룻기": 4, "사무엘상": 31, "사무엘하": 24,
+    "열왕기상": 22, "열왕기하": 25, "역대상": 29, "역대하": 36, "에스라": 10,
+    "느헤미야": 13, "에스더": 10, "욥기": 42, "시편": 150, "잠언": 31,
+    "전도서": 12, "아가": 8, "이사야": 66, "예레미야": 52, "예레미야애가": 5,
+    "에스겔": 48, "다니엘": 12, "호세아": 14, "요엘": 3, "아모스": 9,
+    "오바댜": 1, "요나": 4, "미가": 7, "나훔": 3, "하박국": 3,
+    "스바냐": 3, "학개": 2, "스가랴": 14, "말라기": 4,
+    "마태복음": 28, "마가복음": 16, "누가복음": 24, "요한복음": 21,
+    "사도행전": 28, "로마서": 16, "고린도전서": 16, "고린도후서": 13,
+    "갈라디아서": 6, "에베소서": 6, "빌립보서": 4, "골로새서": 4,
+    "데살로니가전서": 5, "데살로니가후서": 3, "디모데전서": 6, "디모데후서": 4,
+    "디도서": 3, "빌레몬서": 1, "히브리서": 13, "야고보서": 5,
+    "베드로전서": 5, "베드로후서": 3, "요한일서": 5, "요한이서": 1,
+    "요한삼서": 1, "유다서": 1, "요한계시록": 22,
 }
 
 DEFAULT_CHARACTER = {
@@ -61,12 +80,21 @@ def safe_str(value) -> str:
 # ── 세션 초기화 (브라우저 탭마다 완전 독립) ────────────────
 def init_session() -> None:
     defaults: dict = {
-        "api_key":            "",
-        "bible_text":         "",
-        "characters":         [],
-        "selected_character": None,
-        "messages":           [],
-        "extraction_done":    False,
+        "api_key":                    "",
+        # 직접 입력 탭
+        "direct_text":                "",
+        "direct_extraction_done":     False,
+        "direct_characters":          [],
+        "direct_selected_character":  None,
+        "direct_messages":            [],
+        # 성경 구절 불러오기 탭
+        "fetch_sv":                   1,
+        "fetch_ev":                   1,
+        "fetch_preview":              "",
+        "fetch_extraction_done":      False,
+        "fetch_characters":           [],
+        "fetch_selected_character":   None,
+        "fetch_messages":             [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -109,7 +137,39 @@ def make_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+# ── 성경 불러오기 콜백 ────────────────────────────────────
+def _reset_fetch_analysis() -> None:
+    st.session_state.fetch_extraction_done    = False
+    st.session_state.fetch_characters         = []
+    st.session_state.fetch_selected_character = None
+    st.session_state.fetch_messages           = []
+
+def _reset_chapter_and_verses() -> None:
+    st.session_state.fetch_chapter = 1
+    st.session_state.fetch_sv = 1
+    st.session_state.fetch_ev = 1
+    st.session_state.fetch_preview = ""
+    _reset_fetch_analysis()
+
+def _reset_verses() -> None:
+    st.session_state.fetch_sv = 1
+    st.session_state.fetch_ev = 1
+    _reset_fetch_analysis()
+
+
 # ── 성경 불러오기 ─────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def get_verse_count(book_id: int, chapter: int) -> int:
+    url = f"https://bolls.life/get-text/KRV/{book_id}/{chapter}/"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return len(data) if data else 30
+    except Exception:
+        return 30
+
+
 def fetch_bible_text(book_id: int, chapter: int, start_verse: int, end_verse: int) -> str:
     url = f"https://bolls.life/get-text/KRV/{book_id}/{chapter}/"
     try:
@@ -137,19 +197,27 @@ def extract_characters(api_key: str, bible_text: str) -> list[dict]:
         '형식: [{"name":"이름","role":"역할","description":"설명(1문장)"}]'
     )
     client = make_client(api_key)
-    try:
-        resp = client.models.generate_content(
-            model=FLASH_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                http_options=types.HttpOptions(timeout=EXTRACT_TIMEOUT * 1000),
-            ),
-        )
-        raw = safe_str(resp.text).strip()
-    except genai_errors.ClientError:
-        raise
-    except google_exceptions.DeadlineExceeded:
-        raise TimeoutError(f"AI 응답이 {EXTRACT_TIMEOUT}초를 초과했습니다.")
+    raw = ""
+    for attempt, wait in enumerate([0] + QUOTA_RETRY_WAITS):
+        if wait:
+            _log(f"[인물분석] quota 초과 — {wait}초 대기 후 재시도 ({attempt}/{len(QUOTA_RETRY_WAITS)})")
+            time.sleep(wait)
+        try:
+            resp = client.models.generate_content(
+                model=FLASH_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    http_options=types.HttpOptions(timeout=EXTRACT_TIMEOUT * 1000),
+                ),
+            )
+            raw = safe_str(resp.text).strip()
+            break
+        except genai_errors.ClientError as e:
+            if getattr(e, "code", None) == 429 and attempt < len(QUOTA_RETRY_WAITS):
+                continue
+            raise
+        except google_exceptions.DeadlineExceeded:
+            raise TimeoutError(f"AI 응답이 {EXTRACT_TIMEOUT}초를 초과했습니다.")
 
     _log(f"[인물분석] 응답: {raw[:120]}")
 
@@ -289,10 +357,9 @@ def show_api_error(e: Exception) -> None:
 
 
 # ── 대화 이력 텍스트 빌드 ─────────────────────────────────
-def build_download_text() -> str:
-    char = st.session_state.selected_character or DEFAULT_CHARACTER
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
-    sep  = "=" * 50
+def build_download_text(char: dict, bible_text: str, messages: list) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sep = "=" * 50
     lines = [
         sep,
         "AI 큐티 메이트 — 대화 이력",
@@ -300,14 +367,116 @@ def build_download_text() -> str:
         f"대화 상대: {char['name']}",
         sep,
     ]
-    if st.session_state.bible_text:
-        lines += ["", "[오늘의 말씀]", st.session_state.bible_text]
+    if bible_text:
+        lines += ["", "[오늘의 말씀]", bible_text]
     lines += ["", "[대화 내용]"]
-    for msg in st.session_state.messages:
+    for msg in messages:
         label = "나" if msg["role"] == "user" else char["name"]
         lines += ["", f"{label}:", msg["content"]]
     lines.append("\n" + sep)
     return "\n".join(lines)
+
+
+def render_tab_flow(prefix: str, bible_text_val: str) -> None:
+    """탭별 독립 인물 분석 → 인물 선택 → 채팅 흐름"""
+    done_key  = f"{prefix}_extraction_done"
+    chars_key = f"{prefix}_characters"
+    sel_key   = f"{prefix}_selected_character"
+    msgs_key  = f"{prefix}_messages"
+
+    if not st.session_state.get(done_key):
+        return
+
+    # ── Step 2: 인물 선택 ────────────────────────────────
+    st.header("👥 대화 상대 선택")
+    options = [DEFAULT_CHARACTER] + st.session_state[chars_key]
+    names   = [c["name"] for c in options]
+
+    selected_name = st.radio(
+        "대화하고 싶은 인물을 선택하세요:", names, horizontal=True,
+        key=f"{prefix}_char_radio",
+    )
+    selected = next((c for c in options if c["name"] == selected_name), DEFAULT_CHARACTER)
+
+    if st.session_state[sel_key] != selected:
+        st.session_state[sel_key] = selected
+        st.session_state[msgs_key] = []
+
+    with st.expander(f"📋 {selected['name']} 소개", expanded=False):
+        st.markdown(f"**역할:** {selected['role']}")
+        st.markdown(f"**설명:** {selected['description']}")
+
+    # ── Step 3: 채팅 ──────────────────────────────────────
+    char = st.session_state[sel_key]
+    if not char:
+        return
+
+    st.header(f"💬 {char['name']}와(과) 대화")
+
+    if not st.session_state[msgs_key]:
+        st.info(f"안녕하세요, {char['name']}입니다. 오늘의 말씀에 대해 무엇이든 질문해 보세요.")
+
+    for msg in st.session_state[msgs_key]:
+        avatar = None if msg["role"] == "user" else "✝"
+        with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar=avatar):
+            st.write(msg["content"])
+
+    if user_input := st.chat_input(f"{char['name']}에게 질문하세요...", key=f"{prefix}_chat_input"):
+        st.session_state[msgs_key].append({"role": "user", "content": user_input})
+        if len(st.session_state[msgs_key]) > MAX_HISTORY * 2:
+            st.session_state[msgs_key] = st.session_state[msgs_key][-(MAX_HISTORY * 2):]
+
+        with st.spinner(f"{char['name']}이(가) 말씀을 묵상하며 답변하는 중..."):
+            answer = error = None
+            history = st.session_state[msgs_key][:-1]
+            waits = [0] + QUOTA_RETRY_WAITS
+            for attempt, wait in enumerate(waits):
+                if wait:
+                    time.sleep(wait)
+                try:
+                    answer = chat_with_character(
+                        get_api_key(), user_input, char, bible_text_val, history,
+                    )
+                    break
+                except genai_errors.ClientError as e:
+                    if getattr(e, "code", None) == 429 and attempt < len(QUOTA_RETRY_WAITS):
+                        continue
+                    error = e
+                    break
+                except genai_errors.ServerError as e:
+                    if getattr(e, "code", None) == 503 and attempt < len(QUOTA_RETRY_WAITS):
+                        time.sleep(3)
+                        continue
+                    error = e
+                    break
+                except Exception as e:
+                    error = e
+                    break
+
+        if answer is not None:
+            st.session_state[msgs_key].append({"role": "assistant", "content": answer})
+            st.rerun()
+        else:
+            st.session_state[msgs_key].pop()
+            if error:
+                show_api_error(error)
+
+    if st.session_state[msgs_key]:
+        col_dl, col_reset = st.columns(2)
+        with col_dl:
+            filename = f"큐티대화_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+            st.download_button(
+                "💾 대화 이력 저장",
+                data=build_download_text(char, bible_text_val, st.session_state[msgs_key]).encode("utf-8"),
+                file_name=filename,
+                mime="text/plain",
+                use_container_width=True,
+                key=f"{prefix}_download",
+            )
+        with col_reset:
+            if st.button("🗑️ 대화 초기화", type="secondary", use_container_width=True, key=f"{prefix}_reset"):
+                st.session_state[msgs_key] = []
+                st.rerun()
 
 
 # ── 사이드바 ──────────────────────────────────────────────
@@ -367,158 +536,381 @@ def main() -> None:
         )
         st.stop()
 
-    # ── Step 1: 성경 본문 입력 ────────────────────────────
+    # ── UI 스타일 ─────────────────────────────────────────
+    st.markdown("""
+<style>
+/* ── 페이지 배경 ── */
+.stApp { background-color: #fdfbff !important; }
+[data-testid="stSidebar"] {
+    background: linear-gradient(170deg, #f0e9ff 0%, #faf6ff 100%) !important;
+}
+
+/* ── 탭 버튼: 각 50% 너비 ── */
+[data-baseweb="tab-list"] {
+    display: flex !important;
+    background: #ede8fb !important;
+    border-radius: 16px !important;
+    padding: 5px !important;
+    gap: 5px !important;
+    border: none !important;
+    width: 100% !important;
+}
+button[role="tab"] {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+    border-radius: 12px !important;
+    padding: 13px 10px !important;
+    font-size: 1rem !important;
+    font-weight: 700 !important;
+    color: #7c3aed !important;
+    background: transparent !important;
+    border: none !important;
+    transition: all 0.25s ease !important;
+    white-space: nowrap !important;
+}
+button[role="tab"]:hover:not([aria-selected="true"]) {
+    background: rgba(124,58,237,0.09) !important;
+}
+button[role="tab"][aria-selected="true"] {
+    background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%) !important;
+    color: white !important;
+    box-shadow: 0 4px 16px rgba(124,58,237,0.35) !important;
+}
+[data-baseweb="tab-highlight"],
+[data-baseweb="tab-border"] { display: none !important; }
+[data-baseweb="tab-panel"] { padding: 1.5rem 0.1rem 0 !important; }
+
+/* ── 셀렉트박스 ── */
+[data-baseweb="select"] > div:first-child {
+    border-radius: 12px !important;
+    border: 1.5px solid #ddd4f8 !important;
+    background: linear-gradient(135deg, #faf7ff, #f4eeff) !important;
+    transition: border-color .2s, box-shadow .2s !important;
+}
+[data-baseweb="select"] > div:first-child:hover {
+    border-color: #8b5cf6 !important;
+    box-shadow: 0 0 0 3px rgba(139,92,246,0.13) !important;
+}
+.stSelectbox label {
+    font-weight: 700 !important;
+    color: #5b21b6 !important;
+    font-size: 0.8rem !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+}
+
+/* ── 텍스트 영역 ── */
+.stTextArea textarea {
+    border-radius: 12px !important;
+    border: 1.5px solid #ddd4f8 !important;
+    background: linear-gradient(135deg, #faf7ff, #f4eeff) !important;
+    transition: border-color .2s, box-shadow .2s !important;
+    font-size: 0.93rem !important;
+}
+.stTextArea textarea:focus {
+    border-color: #8b5cf6 !important;
+    box-shadow: 0 0 0 3px rgba(139,92,246,0.13) !important;
+}
+.stTextArea label {
+    font-weight: 700 !important;
+    color: #5b21b6 !important;
+    font-size: 0.8rem !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+}
+
+/* ── 버튼: Primary ── */
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%) !important;
+    border: none !important;
+    border-radius: 12px !important;
+    color: white !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.03em !important;
+    box-shadow: 0 4px 16px rgba(124,58,237,0.32) !important;
+    transition: all 0.2s ease !important;
+}
+.stButton > button[kind="primary"]:hover {
+    box-shadow: 0 6px 24px rgba(124,58,237,0.48) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* ── 버튼: Secondary ── */
+.stButton > button[kind="secondary"] {
+    border-radius: 12px !important;
+    border: 1.5px solid #ddd4f8 !important;
+    color: #6d28d9 !important;
+    background: white !important;
+    font-weight: 600 !important;
+    transition: all 0.2s ease !important;
+}
+.stButton > button[kind="secondary"]:hover {
+    background: #f5f0ff !important;
+    border-color: #8b5cf6 !important;
+}
+
+/* ── 제목 색상 ── */
+.stApp h1 { color: #3b0764 !important; }
+.stApp h2 { color: #4c1d95 !important; }
+.stApp h3 { color: #5b21b6 !important; }
+
+/* ── 라디오 버튼 — primaryColor(#7c3aed)로 테마 자동 적용 ── */
+[data-baseweb="radio"] [role="radio"] > div:first-child {
+    border-color: #c4b5fd !important;
+    transition: border-color .2s !important;
+}
+[data-baseweb="radio"] [role="radio"][aria-checked="true"] > div:first-child {
+    border-color: #7c3aed !important;
+    background-color: #7c3aed !important;
+}
+[data-baseweb="radio"] [role="radio"][aria-checked="false"] > div:first-child {
+    background-color: white !important;
+}
+[data-baseweb="radio"] [role="radio"]:hover > div:first-child {
+    border-color: #8b5cf6 !important;
+}
+
+/* ── 알림/인포박스 (파란색 → 보라색) ── */
+[data-testid="stAlert"] > div {
+    border-radius: 12px !important;
+    background: linear-gradient(135deg, #f5f0ff, #fdf8ff) !important;
+    border-left: 4px solid #8b5cf6 !important;
+    color: #4c1d95 !important;
+}
+[data-testid="stAlert"] p { color: #4c1d95 !important; }
+
+/* ── 경고박스 ── */
+[data-testid="stAlert"][data-type="warning"] > div {
+    background: linear-gradient(135deg, #fffbeb, #fef9e7) !important;
+    border-left-color: #f59e0b !important;
+    color: #78350f !important;
+}
+
+/* ── 에러박스 ── */
+[data-testid="stAlert"][data-type="error"] > div {
+    background: linear-gradient(135deg, #fff1f2, #fef2f2) !important;
+    border-left-color: #f43f5e !important;
+    color: #9f1239 !important;
+}
+
+/* ── 익스팬더 ── */
+[data-testid="stExpander"] {
+    border-radius: 12px !important;
+    border: 1.5px solid #ddd4f8 !important;
+    background: white !important;
+    overflow: hidden !important;
+}
+[data-testid="stExpander"] summary {
+    color: #5b21b6 !important;
+    font-weight: 600 !important;
+}
+[data-testid="stExpander"] summary:hover {
+    background: #f5f0ff !important;
+}
+[data-testid="stExpander"] summary svg { color: #8b5cf6 !important; }
+
+/* ── 채팅 입력창 wrapper 배경 제거 ── */
+[data-testid="stChatInput"] {
+    background: transparent !important;
+    padding: 0 !important;
+}
+[data-testid="stBottom"],
+[data-testid="stBottom"] > div {
+    background: transparent !important;
+    box-shadow: none !important;
+    border-top: none !important;
+}
+/* ── 채팅 입력창 pill 스타일 ── */
+[data-testid="stChatInput"] > div {
+    border-radius: 50px !important;
+    border: 2px solid #c4b5fd !important;
+    background: rgba(255,255,255,0.95) !important;
+    box-shadow: 0 2px 16px rgba(124,58,237,0.12) !important;
+    transition: border-color .2s, box-shadow .2s !important;
+}
+[data-testid="stChatInput"] > div:focus-within {
+    border-color: #7c3aed !important;
+    box-shadow: 0 0 0 3px rgba(124,58,237,0.15), 0 4px 20px rgba(124,58,237,0.18) !important;
+}
+[data-testid="stChatInputSubmitButton"] button {
+    background: linear-gradient(135deg, #7c3aed, #a855f7) !important;
+    border-radius: 50% !important;
+    color: white !important;
+    border: none !important;
+    box-shadow: 0 2px 8px rgba(124,58,237,0.35) !important;
+}
+
+/* ── 다운로드 버튼 ── */
+[data-testid="stDownloadButton"] button {
+    border-radius: 12px !important;
+    border: 1.5px solid #ddd4f8 !important;
+    color: #6d28d9 !important;
+    background: white !important;
+    font-weight: 600 !important;
+    transition: all 0.2s ease !important;
+}
+[data-testid="stDownloadButton"] button:hover {
+    background: #f5f0ff !important;
+    border-color: #8b5cf6 !important;
+    color: #4c1d95 !important;
+}
+
+/* ── 채팅 메시지 버블 ── */
+[data-testid="stChatMessage"] {
+    border-radius: 14px !important;
+    border: 1px solid #ede8fb !important;
+    background: white !important;
+    box-shadow: 0 2px 8px rgba(124,58,237,0.06) !important;
+    padding-right: 1.2rem !important;
+}
+
+/* ── 스피너 ── */
+[data-testid="stSpinner"] > div {
+    color: #7c3aed !important;
+}
+
+/* ── 인물 분석 완료 뱃지 ── */
+.badge-done {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: linear-gradient(135deg, #ede9fe, #ddd6fe);
+    color: #5b21b6;
+    padding: 5px 14px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    border: 1px solid #c4b5fd;
+    white-space: nowrap;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    # ── Step 1~3: 탭별 완전 독립 ─────────────────────────
     st.header("📖 오늘의 말씀")
+    tab_input, tab_fetch = st.tabs(["✍️ 직접 입력", "📥 성경 구절 불러오기"])
 
-    fetch_mode = st.toggle("📥 성경 구절 불러오기", value=False)
+    with tab_input:
+        st.text_area(
+            "성경 본문",
+            height=180,
+            key="direct_text",
+            label_visibility="collapsed",
+            placeholder=(
+                "예) 요한복음 3:16  하나님이 세상을 이처럼 사랑하사 독생자를 주셨으니 "
+                "이는 그를 믿는 자마다 멸망하지 않고 영생을 얻게 하려 하심이라.\n\n"
+                "오늘 읽은 성경 구절이나 단락을 입력하세요."
+            ),
+        )
+        c_btn, c_status = st.columns([1, 4])
+        with c_btn:
+            direct_analyze = st.button("🔍 인물 분석", type="primary", use_container_width=True, key="analyze_direct")
+        with c_status:
+            if st.session_state.direct_extraction_done:
+                st.markdown('<span class="badge-done">✓ 인물 분석 완료</span>', unsafe_allow_html=True)
 
-    if fetch_mode:
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        if direct_analyze:
+            if not st.session_state.direct_text.strip():
+                st.warning("성경 본문을 먼저 입력해주세요.")
+            else:
+                st.session_state.direct_extraction_done    = False
+                st.session_state.direct_selected_character = None
+                st.session_state.direct_messages           = []
+                with st.spinner("성경 본문에서 등장인물을 분석하는 중..."):
+                    try:
+                        chars = extract_characters(get_api_key(), st.session_state.direct_text)
+                        st.session_state.direct_characters      = chars
+                        st.session_state.direct_extraction_done = True
+                    except Exception as e:
+                        show_api_error(e)
+                if st.session_state.direct_extraction_done:
+                    if not st.session_state.direct_characters:
+                        st.info("명확한 등장인물을 찾지 못했습니다. '지혜로운 조언자'와 대화를 시작할 수 있습니다.")
+                    st.rerun()
+
+        render_tab_flow("direct", st.session_state.direct_text)
+
+    with tab_fetch:
+        book_name = st.selectbox(
+            "성경책", list(BIBLE_BOOKS.keys()),
+            key="fetch_book",
+            on_change=_reset_chapter_and_verses,
+        )
+        max_ch = BIBLE_CHAPTERS.get(book_name, 50)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            book_name = st.selectbox("성경책", list(BIBLE_BOOKS.keys()), label_visibility="collapsed")
-        with c2:
-            chapter_num = st.number_input("장", min_value=1, max_value=150, value=1, step=1)
-        with c3:
-            sv = st.number_input("시작 절", min_value=1, value=1, step=1)
-        with c4:
-            ev = st.number_input("끝 절", min_value=1, value=1, step=1)
+            chapter_num = st.selectbox(
+                "장", list(range(1, max_ch + 1)),
+                key="fetch_chapter",
+                on_change=_reset_verses,
+            )
 
-        if st.button("📥 말씀 불러오기", type="secondary"):
+        verse_count = get_verse_count(BIBLE_BOOKS[book_name], chapter_num)
+        verse_options = list(range(1, verse_count + 1))
+
+        sv_cur = st.session_state.get("fetch_sv", 1)
+        sv_idx = verse_options.index(sv_cur) if sv_cur in verse_options else 0
+        with c2:
+            sv = st.selectbox("시작 절", verse_options, index=sv_idx)
+        if sv != st.session_state.fetch_sv:
+            _reset_fetch_analysis()
+        st.session_state.fetch_sv = sv
+
+        end_options = [v for v in verse_options if v >= sv]
+        ev_cur = st.session_state.get("fetch_ev", sv)
+        if ev_cur not in end_options:
+            ev_cur = sv
+        ev_idx = end_options.index(ev_cur)
+        with c3:
+            ev = st.selectbox("끝 절", end_options, index=ev_idx)
+        if ev != st.session_state.fetch_ev:
+            _reset_fetch_analysis()
+        st.session_state.fetch_ev = ev
+
+        if st.button("📥 말씀 불러오기", type="primary"):
             with st.spinner("말씀을 불러오는 중..."):
                 fetched = fetch_bible_text(BIBLE_BOOKS[book_name], chapter_num, sv, ev)
             if fetched:
                 header = f"{book_name} {chapter_num}:{sv}" + (f"~{ev}" if ev > sv else "")
-                st.session_state.bible_text = f"[{header}]\n{fetched}"
-                st.session_state.extraction_done = False
-                st.session_state.selected_character = None
-                st.session_state.messages = []
-                st.rerun()
+                st.session_state.fetch_preview = f"[{header}]\n{fetched}"
             else:
                 st.error("말씀을 불러오지 못했습니다. 장/절 번호를 확인해주세요.")
 
-    bible_text = st.text_area(
-        "성경 본문",
-        value=st.session_state.bible_text,
-        height=180,
-        label_visibility="collapsed",
-        placeholder=(
-            "예) 요한복음 3:16  하나님이 세상을 이처럼 사랑하사 독생자를 주셨으니 "
-            "이는 그를 믿는 자마다 멸망하지 않고 영생을 얻게 하려 하심이라.\n\n"
-            "오늘 읽은 성경 구절이나 단락을 입력하세요."
-        ),
-    )
+        st.text_area(
+            "📖 말씀 미리보기",
+            value=st.session_state.fetch_preview,
+            height=180,
+            disabled=True,
+            placeholder="성경책, 장, 절을 선택하고 '말씀 불러오기'를 누르세요.",
+        )
 
-    col_btn, col_status = st.columns([1, 4])
-    with col_btn:
-        analyze_clicked = st.button("🔍 인물 분석", type="primary", use_container_width=True)
-    with col_status:
-        if st.session_state.extraction_done:
-            st.caption("✅ 인물 분석 완료")
+        c_btn2, c_status2 = st.columns([1, 4])
+        with c_btn2:
+            fetch_analyze = st.button("🔍 인물 분석", type="primary", use_container_width=True, key="analyze_fetch")
+        with c_status2:
+            if st.session_state.fetch_extraction_done:
+                st.markdown('<span class="badge-done">✓ 인물 분석 완료</span>', unsafe_allow_html=True)
 
-    if analyze_clicked:
-        if not bible_text.strip():
-            st.warning("성경 본문을 먼저 입력해주세요.")
-        else:
-            st.session_state.bible_text         = bible_text
-            st.session_state.messages           = []
-            st.session_state.selected_character = None
-            st.session_state.extraction_done    = False
+        if fetch_analyze:
+            if not st.session_state.fetch_preview.strip():
+                st.warning("말씀을 먼저 불러와주세요.")
+            else:
+                st.session_state.fetch_extraction_done    = False
+                st.session_state.fetch_selected_character = None
+                st.session_state.fetch_messages           = []
+                with st.spinner("성경 본문에서 등장인물을 분석하는 중..."):
+                    try:
+                        chars = extract_characters(get_api_key(), st.session_state.fetch_preview)
+                        st.session_state.fetch_characters      = chars
+                        st.session_state.fetch_extraction_done = True
+                    except Exception as e:
+                        show_api_error(e)
+                if st.session_state.fetch_extraction_done:
+                    if not st.session_state.fetch_characters:
+                        st.info("명확한 등장인물을 찾지 못했습니다. '지혜로운 조언자'와 대화를 시작할 수 있습니다.")
+                    st.rerun()
 
-            with st.spinner("성경 본문에서 등장인물을 분석하는 중..."):
-                try:
-                    chars = extract_characters(get_api_key(), bible_text)
-                    st.session_state.characters      = chars
-                    st.session_state.extraction_done = True
-                    if not chars:
-                        st.info(
-                            "명확한 등장인물을 찾지 못했습니다. "
-                            "'지혜로운 조언자'와 대화를 시작할 수 있습니다."
-                        )
-                except Exception as e:
-                    show_api_error(e)
-
-    # ── Step 2: 인물 선택 ────────────────────────────────
-    if st.session_state.extraction_done:
-        st.header("👥 대화 상대 선택")
-        options = [DEFAULT_CHARACTER] + st.session_state.characters
-        names   = [c["name"] for c in options]
-
-        selected_name = st.radio("대화하고 싶은 인물을 선택하세요:", names, horizontal=True)
-        selected = next((c for c in options if c["name"] == selected_name), DEFAULT_CHARACTER)
-
-        if st.session_state.selected_character != selected:
-            st.session_state.selected_character = selected
-            st.session_state.messages           = []
-
-        with st.expander(f"📋 {selected['name']} 소개", expanded=False):
-            st.markdown(f"**역할:** {selected['role']}")
-            st.markdown(f"**설명:** {selected['description']}")
-
-    # ── Step 3: 채팅 ──────────────────────────────────────
-    if not st.session_state.selected_character:
-        return
-
-    char = st.session_state.selected_character
-    st.header(f"💬 {char['name']}와(과) 대화")
-
-    if not st.session_state.messages:
-        st.info(f"안녕하세요, {char['name']}입니다. 오늘의 말씀에 대해 무엇이든 질문해 보세요.")
-
-    for msg in st.session_state.messages:
-        avatar = None if msg["role"] == "user" else "✝"
-        with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar=avatar):
-            st.write(msg["content"])
-
-    if user_input := st.chat_input(f"{char['name']}에게 질문하세요..."):
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        if len(st.session_state.messages) > MAX_HISTORY * 2:
-            st.session_state.messages = st.session_state.messages[-(MAX_HISTORY * 2):]
-
-        with st.spinner(f"{char['name']}이(가) 말씀을 묵상하며 답변하는 중..."):
-            answer = error = None
-            history = st.session_state.messages[:-1]
-
-            for attempt in range(3):
-                try:
-                    answer = chat_with_character(
-                        get_api_key(), user_input, char,
-                        st.session_state.bible_text, history,
-                    )
-                    break
-                except genai_errors.ServerError as e:
-                    if getattr(e, "code", None) == 503 and attempt < 2:
-                        time.sleep(3)
-                        continue
-                    error = e
-                    break
-                except Exception as e:
-                    error = e
-                    break
-
-        if answer is not None:
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.rerun()
-        else:
-            st.session_state.messages.pop()
-            if error:
-                show_api_error(error)
-
-    # 하단 버튼 (대화 이력이 있을 때만)
-    if st.session_state.messages:
-        col_dl, col_reset = st.columns(2)
-        with col_dl:
-            filename = f"큐티대화_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-            st.download_button(
-                "💾 대화 이력 저장",
-                data=build_download_text().encode("utf-8"),
-                file_name=filename,
-                mime="text/plain",
-                use_container_width=True,
-            )
-        with col_reset:
-            if st.button("🗑️ 대화 초기화", type="secondary", use_container_width=True):
-                st.session_state.messages = []
-                st.rerun()
+        render_tab_flow("fetch", st.session_state.fetch_preview)
 
 
 if __name__ == "__main__":

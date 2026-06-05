@@ -1,6 +1,6 @@
 # Streamlit secrets (API 키 등 민감 정보 — 절대 커밋 금지)
 .streamlit/secrets.toml
-.streamlit/
+# config.toml은 커밋 필요 (배포용) — secrets.toml만 제외
 
 # 환경 변수 파일
 .env
