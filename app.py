@@ -550,6 +550,13 @@ def main() -> None:
     # ── UI 스타일 ─────────────────────────────────────────
     st.markdown("""
 <style>
+/* ── GitHub 툴바 버튼 숨김 ── */
+[data-testid="stToolbar"] button[aria-label*="GitHub"],
+[data-testid="stToolbar"] button[aria-label*="source"],
+[data-testid="stHeader"] button[aria-label*="GitHub"] {
+    display: none !important;
+}
+
 /* ── 페이지 배경 ── */
 .stApp { background-color: #fdfbff !important; }
 [data-testid="stSidebar"] {
