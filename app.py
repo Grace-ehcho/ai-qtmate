@@ -343,17 +343,28 @@ def show_api_error(e: Exception) -> None:
                 "2. 계속 초과된다면 [Google AI Studio](https://aistudio.google.com/app/apikey)에서 결제 설정을 확인하세요."
             )
         else:
-            st.error(f"API 오류 (코드 {code}): {e}")
-    elif isinstance(e, genai_errors.ServerError) and getattr(e, "code", None) == 503:
-        st.error("🔄 **AI 서버가 일시적으로 혼잡합니다.**")
-        st.info("30초~1분 후 다시 시도해주세요.")
+            st.error("⚠️ **API 요청 중 오류가 발생했습니다.**")
+            st.info("잠시 후 다시 시도해주세요.")
+    elif isinstance(e, genai_errors.ServerError):
+        code = getattr(e, "code", None)
+        if code == 503:
+            st.error("🔄 **AI 서버가 일시적으로 혼잡합니다.**")
+            st.info("30초~1분 후 다시 시도해주세요.")
+        elif code == 504:
+            st.error("⏱️ **AI 서버 응답 시간이 초과되었습니다. (504)**")
+            st.info(
+                "서버가 일시적으로 지연되고 있습니다.\n"
+                "잠시 후 다시 시도하거나, 성경 본문을 더 짧게 입력해보세요."
+            )
+        else:
+            st.error("🔄 **AI 서버에서 일시적인 오류가 발생했습니다.**")
+            st.info("잠시 후 다시 시도해주세요.")
     elif isinstance(e, TimeoutError):
         st.error("⏱️ **응답 시간이 초과되었습니다.**")
         st.info("네트워크 상태를 확인하거나 잠시 후 다시 시도해주세요.")
     else:
-        st.error(f"오류가 발생했습니다: {type(e).__name__}: {e}")
-        with st.expander("🔍 상세 오류 정보"):
-            st.code(traceback.format_exc())
+        st.error("⚠️ **일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요.**")
+        _log(f"[오류] {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 # ── 대화 이력 텍스트 빌드 ─────────────────────────────────
@@ -722,7 +733,7 @@ button[role="tab"][aria-selected="true"] {
 }
 /* ── 채팅 입력창 pill 스타일 ── */
 [data-testid="stChatInput"] > div {
-    border-radius: 50px !important;
+    border-radius: 20px !important;
     border: 2px solid #c4b5fd !important;
     background: rgba(255,255,255,0.95) !important;
     box-shadow: 0 2px 16px rgba(124,58,237,0.12) !important;
@@ -731,6 +742,24 @@ button[role="tab"][aria-selected="true"] {
 [data-testid="stChatInput"] > div:focus-within {
     border-color: #7c3aed !important;
     box-shadow: 0 0 0 3px rgba(124,58,237,0.15), 0 4px 20px rgba(124,58,237,0.18) !important;
+}
+/* 내부 컨테이너: grid로 textarea(좌) | 버튼(우) 배치 */
+[data-testid="stChatInput"] > div > div {
+    display: grid !important;
+    grid-template-columns: 1fr auto !important;
+    grid-template-rows: auto !important;
+    align-items: center !important;
+}
+[data-testid="stChatInput"] > div > div > div:first-child {
+    grid-column: 1 !important;
+    grid-row: 1 !important;
+    min-width: 0 !important;
+}
+[data-testid="stChatInput"] > div > div > div:last-child {
+    grid-column: 2 !important;
+    grid-row: 1 !important;
+    align-self: center !important;
+    padding-right: 0.35rem !important;
 }
 [data-testid="stChatInputSubmitButton"] button {
     background: linear-gradient(135deg, #7c3aed, #a855f7) !important;
@@ -783,6 +812,117 @@ button[role="tab"][aria-selected="true"] {
     border: 1px solid #c4b5fd;
     white-space: nowrap;
 }
+
+/* ─────────────────────────────────────
+   모바일 반응형
+   ───────────────────────────────────── */
+
+/* 태블릿 / 대형 폰 (≤ 768px) */
+@media screen and (max-width: 768px) {
+    .stApp h1 { font-size: 1.6rem !important; }
+
+    button[role="tab"] {
+        font-size: 0.88rem !important;
+        padding: 11px 8px !important;
+    }
+
+    /* 가로 라디오 — 줄바꿈 허용 */
+    [data-testid="stRadio"] > div:last-child {
+        flex-wrap: wrap !important;
+        gap: 6px 12px !important;
+    }
+}
+
+/* 일반 폰 (≤ 480px) */
+@media screen and (max-width: 480px) {
+    /* 제목 */
+    .stApp h1 { font-size: 1.35rem !important; }
+    .stApp h2 { font-size: 1.1rem !important; }
+    .stApp h3 { font-size: 0.95rem !important; }
+
+    /* 탭 리스트 */
+    [data-baseweb="tab-list"] {
+        padding: 4px !important;
+        gap: 4px !important;
+        border-radius: 12px !important;
+    }
+    /* 탭 버튼 — 텍스트 줄바꿈 허용 */
+    button[role="tab"] {
+        font-size: 0.75rem !important;
+        padding: 9px 5px !important;
+        border-radius: 9px !important;
+        white-space: normal !important;
+        word-break: keep-all !important;
+        line-height: 1.3 !important;
+        text-align: center !important;
+    }
+
+    /* 라디오 — 줄바꿈 강제 */
+    [data-testid="stRadio"] > div:last-child {
+        flex-wrap: wrap !important;
+        gap: 6px 10px !important;
+    }
+
+    /* 셀렉트박스 */
+    .stSelectbox label {
+        font-size: 0.72rem !important;
+    }
+
+    /* 텍스트 영역 */
+    .stTextArea textarea { font-size: 0.85rem !important; }
+    .stTextArea label   { font-size: 0.72rem !important; }
+
+    /* "Press ⌘+Enter to apply" 힌트 텍스트 — 모바일 키보드 미지원으로 불필요, 숨김 */
+    [data-testid="InputInstructions"] { display: none !important; }
+
+    /* 버튼 */
+    .stButton > button,
+    [data-testid="stDownloadButton"] button {
+        font-size: 0.82rem !important;
+    }
+
+    /* 뱃지 */
+    .badge-done {
+        font-size: 0.72rem !important;
+        padding: 3px 8px !important;
+    }
+
+    /* 채팅 메시지 패딩 */
+    [data-testid="stChatMessage"] {
+        padding-right: 0.5rem !important;
+    }
+
+    /* 채팅 입력창 pill 반경 */
+    [data-testid="stChatInput"] > div {
+        border-radius: 24px !important;
+    }
+}
+
+/* 초소형 폰 (≤ 360px) */
+@media screen and (max-width: 360px) {
+    .stApp h1 { font-size: 1.15rem !important; }
+    .stApp h2 { font-size: 0.98rem !important; }
+
+    [data-baseweb="tab-list"] {
+        padding: 3px !important;
+        gap: 3px !important;
+    }
+    button[role="tab"] {
+        font-size: 0.68rem !important;
+        padding: 8px 4px !important;
+        border-radius: 8px !important;
+    }
+
+    .badge-done {
+        font-size: 0.66rem !important;
+        padding: 3px 6px !important;
+    }
+
+    .stButton > button,
+    [data-testid="stDownloadButton"] button {
+        font-size: 0.75rem !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -802,7 +942,7 @@ button[role="tab"][aria-selected="true"] {
                 "오늘 읽은 성경 구절이나 단락을 입력하세요."
             ),
         )
-        c_btn, c_status = st.columns([1, 4])
+        c_btn, c_status = st.columns([1, 3])
         with c_btn:
             direct_analyze = st.button("🔍 인물 분석", type="primary", use_container_width=True, key="analyze_direct")
         with c_status:
@@ -884,7 +1024,7 @@ button[role="tab"][aria-selected="true"] {
             placeholder="성경책, 장, 절을 선택하고 '말씀 불러오기'를 누르세요.",
         )
 
-        c_btn2, c_status2 = st.columns([1, 4])
+        c_btn2, c_status2 = st.columns([1, 3])
         with c_btn2:
             fetch_analyze = st.button("🔍 인물 분석", type="primary", use_container_width=True, key="analyze_fetch")
         with c_status2:
